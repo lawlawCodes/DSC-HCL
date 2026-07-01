@@ -1,0 +1,75 @@
+# # # # # # # # # # # # # #
+# 1. datasets
+# # # # # # # # # # # # # #
+dataset: # Required.
+  type: pascal
+  train:
+    data_root: /home/chicken/Code/AugSeg-main1/data/VOC2012
+    data_list: /home/chicken/Code/AugSeg-main1/data/splitsall/pascal/2646/labeled.txt
+    batch_size: 8
+    flip: True
+    rand_resize: [0.5, 2.0]
+    resize_base_size: 500
+    crop:
+      type: rand
+      size: [513, 513]
+  val:
+    data_root: /home/chicken/Code/AugSeg-main1/data/VOC2012
+    data_list: /home/chicken/Code/AugSeg-main1/data/splitsall/pascal/val.txt
+    batch_size: 1
+  n_sup: 2646
+  workers: 4
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  ignore_label: 255
+
+# # # # # # # # # # # # # #
+# 2. training params
+# # # # # # # # # # # # # #
+trainer: # Required.
+  epochs: 80
+  optimizer:
+    type: SGD
+    kwargs:
+      lr: 0.001
+      momentum: 0.9
+      weight_decay: 0.0001
+  lr_scheduler:
+    mode: poly
+    kwargs:
+      power: 0.9
+
+# # # # # # # # # # # # # #
+# 3. output files, and loss
+# # # # # # # # # # # # # #
+saver:
+  snapshot_dir: sup/checkpoints
+  pretrain: ''
+  use_tb: False
+
+criterion:
+  type: CELoss
+  kwargs:
+    use_weight: False
+
+# # # # # # # # # # # # # #
+# 4. models
+# # # # # # # # # # # # # #
+net: # Required.
+  num_classes: 21
+  sync_bn: True
+  ema_decay: 0.999
+  encoder:
+    type: augseg.models.resnet.resnet101
+    pretrain: /home/chicken/Code/AugSeg-main1/pretrained/resnet101.pth
+    kwargs:
+      zero_init_residual: True
+      multi_grid: False
+      replace_stride_with_dilation: [False, False, True]
+  decoder:
+    type: augseg.models.decoder.dec_deeplabv3_plus
+    kwargs:
+      inner_planes: 256
+      low_conv_planes: 48
+      dilations: [6, 12, 18]
+

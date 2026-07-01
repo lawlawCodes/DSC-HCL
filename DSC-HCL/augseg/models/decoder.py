@@ -1,0 +1,228 @@
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
+def get_syncbn():
+    # return nn.BatchNorm2d
+    return nn.SyncBatchNorm
+
+#就是多添加的动态权重机制
+# class DW_CBAM(nn.Module):
+#     """动态权重CBAM模块"""
+#
+#     def __init__(self, in_channels, reduction_ratio=16):
+#         super().__init__()
+#         self.channel_att = nn.Sequential(
+#             nn.AdaptiveAvgPool2d(1),
+#             nn.Conv2d(in_channels, in_channels // reduction_ratio, 1),
+#             nn.ReLU(inplace=True),
+#             nn.Conv2d(in_channels // reduction_ratio, in_channels, 1),
+#             nn.Sigmoid()
+#         )
+#
+#         # 动态权重生成器
+#         self.weight_gen = nn.Sequential(
+#             nn.Conv2d(in_channels, in_channels // 8, 3, padding=1),
+#             nn.ReLU(inplace=True),
+#             nn.Conv2d(in_channels // 8, 2, 1),  # 生成通道和空间注意力的混合权重
+#             nn.Softmax(dim=1)
+#         )
+#
+#         # 空间注意力
+#         self.spatial_conv = nn.Conv2d(2, 1, 7, padding=3)
+#
+#     def forward(self, x):
+#         # 通道注意力
+#         channel_weights = self.channel_att(x)
+#
+#         # 空间注意力
+#         spatial_avg = torch.mean(x, dim=1, keepdim=True)
+#         spatial_max, _ = torch.max(x, dim=1, keepdim=True)
+#         spatial_weights = torch.sigmoid(self.spatial_conv(torch.cat([spatial_avg, spatial_max], dim=1)))
+#
+#         # 动态权重
+#         mix_weights = self.weight_gen(x)  # [B, 2, H, W]
+#
+#         # 动态混合
+#         channel_mix = channel_weights * mix_weights[:, 0:1]
+#         spatial_mix = spatial_weights * mix_weights[:, 1:2]
+#         x_final = x * (channel_mix + spatial_mix)
+#
+#         return x_final
+
+class dec_deeplabv3_plus(nn.Module):
+    def __init__(
+        self,
+        in_planes,
+        num_classes=19,
+        inner_planes=256,
+        sync_bn=False,
+        dilations=(12, 24, 36),
+        low_conv_planes=48,
+        # use_attention=True  # 新增注意力控制开关
+    ):
+        super(dec_deeplabv3_plus, self).__init__()
+        # self.use_attention = use_attention
+
+        norm_layer = get_syncbn() if sync_bn else nn.BatchNorm2d
+
+        self.low_conv = nn.Sequential(
+            nn.Conv2d(256, low_conv_planes, kernel_size=1), 
+            norm_layer(low_conv_planes), 
+            nn.ReLU(inplace=True)
+        )
+
+        self.aspp = ASPP(
+            in_planes, inner_planes=inner_planes, sync_bn=sync_bn, dilations=dilations
+        )
+
+        self.head = nn.Sequential(
+            nn.Conv2d(self.aspp.get_outplanes(), 256, 1, bias=False),
+            norm_layer(256),
+            nn.ReLU(inplace=True),
+        )
+        #
+        # 在分类器前添加CBAM
+        # if self.use_attention:
+        #     # 融合后特征通道数 = 256 + low_conv_planes
+        #     self.fusion_attn = DW_CBAM(256 + low_conv_planes)
+
+        self.classifier = nn.Sequential(
+            nn.Conv2d(256+int(low_conv_planes), 256, kernel_size=3, stride=1, padding=1, bias=False),
+            norm_layer(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1, bias=False),
+            norm_layer(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, num_classes, kernel_size=1, stride=1, padding=0, bias=True),
+        )
+
+
+    def forward(self, x, return_projection = False):
+        x1, x2, x3, x4 = x
+        low_feat = self.low_conv(x1)
+        h, w = low_feat.size()[-2:]
+
+        aspp_out = self.aspp(x4)
+        aspp_out = self.head(aspp_out)
+        aspp_out = F.interpolate(
+            aspp_out, size=(h, w), mode="bilinear", align_corners=True
+        )
+
+        aspp_out = torch.cat((low_feat, aspp_out), dim=1)
+
+        # 添加注意力模块
+        # if self.use_attention:
+        #     aspp_out = self.fusion_attn(aspp_out)
+        # 分割输出
+        seg_output = self.classifier(aspp_out)
+        return seg_output
+
+
+class Aux_Module(nn.Module):
+    def __init__(self, in_planes, num_classes=19, sync_bn=False):
+        super(Aux_Module, self).__init__()
+
+        norm_layer = get_syncbn() if sync_bn else nn.BatchNorm2d
+        self.aux = nn.Sequential(
+            nn.Conv2d(in_planes, 256, kernel_size=3, stride=1, padding=1, bias=False),
+            norm_layer(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, num_classes, kernel_size=1, stride=1, padding=0, bias=True),
+        )
+
+    def forward(self, x):
+        res = self.aux(x)
+        return res
+
+
+class ASPP(nn.Module):
+    """
+    Reference:
+        Chen, Liang-Chieh, et al. *"Rethinking Atrous Convolution for Semantic Image Segmentation."*
+    """
+
+    def __init__(
+        self, in_planes, inner_planes=256, sync_bn=False, dilations=(12, 24, 36)
+    ):
+        super(ASPP, self).__init__()
+
+        norm_layer = get_syncbn() if sync_bn else nn.BatchNorm2d
+        self.conv1 = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Conv2d(
+                in_planes,
+                inner_planes,
+                kernel_size=1,
+                padding=0,
+                dilation=1,
+                bias=False,
+            ),
+            norm_layer(inner_planes),
+            nn.ReLU(inplace=True),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(
+                in_planes,
+                inner_planes,
+                kernel_size=1,
+                padding=0,
+                dilation=1,
+                bias=False,
+            ),
+            norm_layer(inner_planes),
+            nn.ReLU(inplace=True),
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(
+                in_planes,
+                inner_planes,
+                kernel_size=3,
+                padding=dilations[0],
+                dilation=dilations[0],
+                bias=False,
+            ),
+            norm_layer(inner_planes),
+            nn.ReLU(inplace=True),
+        )
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(
+                in_planes,
+                inner_planes,
+                kernel_size=3,
+                padding=dilations[1],
+                dilation=dilations[1],
+                bias=False,
+            ),
+            norm_layer(inner_planes),
+            nn.ReLU(inplace=True),
+        )
+        self.conv5 = nn.Sequential(
+            nn.Conv2d(
+                in_planes,
+                inner_planes,
+                kernel_size=3,
+                padding=dilations[2],
+                dilation=dilations[2],
+                bias=False,
+            ),
+            norm_layer(inner_planes),
+            nn.ReLU(inplace=True),
+        )
+
+        self.out_planes = (len(dilations) + 2) * inner_planes
+
+    def get_outplanes(self):
+        return self.out_planes
+
+    def forward(self, x):
+        _, _, h, w = x.size()
+        feat1 = F.interpolate(
+            self.conv1(x), size=(h, w), mode="bilinear", align_corners=True
+        )
+        feat2 = self.conv2(x)
+        feat3 = self.conv3(x)
+        feat4 = self.conv4(x)
+        feat5 = self.conv5(x)
+        aspp_out = torch.cat((feat1, feat2, feat3, feat4, feat5), 1)
+        return aspp_out
